@@ -350,6 +350,7 @@ pub enum CodeReviewAction {
     ViewPr(String),
     PublishBranch,
     SubmitReviewComments,
+    CopyReviewCommentsToClipboard,
 }
 
 pub struct FileState {
@@ -1655,6 +1656,9 @@ impl CodeReviewView {
             CommentListEvent::Submitted => {
                 self.handle_submit_review_with_comments(ctx);
                 ctx.notify();
+            }
+            CommentListEvent::CopyForAgent => {
+                self.handle_copy_review_prompt(ctx);
             }
             CommentListEvent::Cancelled => {
                 self.clear_review_comments(ctx);
@@ -4220,10 +4224,10 @@ impl CodeReviewView {
 
     /// Prepares review comments and emits an event for a higher-level view to route
     /// them to an available terminal.
-    fn handle_submit_review_with_comments(&mut self, ctx: &mut ViewContext<Self>) {
-        let Some(model) = self.active_comment_model.as_ref() else {
-            return;
-        };
+    /// Builds an agent-ready batch from the non-outdated queued comments, or `None` when there is
+    /// nothing to send.
+    fn pending_agent_review_batch(&self, ctx: &AppContext) -> Option<AgentReviewCommentBatch> {
+        let model = self.active_comment_model.as_ref()?;
 
         let review_comments = model.read(ctx, |batch, _| batch.clone());
 
@@ -4235,25 +4239,48 @@ impl CodeReviewView {
 
         if active_comments.is_empty() {
             log::info!("No review comments to submit");
-            return;
+            return None;
         }
+
+        let active_batch = ReviewCommentBatch::from_comments(active_comments);
+        let diff_set = self.collect_diff_set(&active_batch);
+        Some(AgentReviewCommentBatch {
+            comments: active_batch.comments,
+            diff_set,
+        })
+    }
+
+    fn handle_submit_review_with_comments(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(agent_comment_batch) = self.pending_agent_review_batch(ctx) else {
+            return;
+        };
 
         let Some(repo_path) = self.repo_path().cloned() else {
             log::warn!("No active repo path for submitting review");
             return;
         };
 
-        let active_batch = ReviewCommentBatch::from_comments(active_comments);
-        let diff_set = self.collect_diff_set(&active_batch);
-        let agent_comment_batch = AgentReviewCommentBatch {
-            comments: active_batch.comments,
-            diff_set,
-        };
-
         ctx.emit(CodeReviewViewEvent::SubmitReviewComments {
             comments: agent_comment_batch,
             repo_path,
         });
+    }
+
+    /// Copies the same prompt "Send to Agent" would deliver to a CLI agent, for users with no
+    /// agent running in this session, then clears the tray like a successful send does.
+    fn handle_copy_review_prompt(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(batch) = self.pending_agent_review_batch(ctx) else {
+            return;
+        };
+
+        let text = crate::terminal::cli_agent::build_review_prompt(&batch);
+        ctx.clipboard().write(ClipboardContent::plain_text(text));
+        self.clear_review_comments(ctx);
+        ToastStack::handle(ctx).update(ctx, |stack, ctx| {
+            let toast = DismissibleToast::default("Review prompt copied".into());
+            stack.add_ephemeral_toast(toast, self.window_id, ctx);
+        });
+        ctx.notify();
     }
 
     /// Called by the routing layer (RightPanelView) after attempting to submit review
@@ -7594,6 +7621,9 @@ impl TypedActionView for CodeReviewView {
                     self.handle_submit_review_with_comments(ctx);
                     ctx.notify();
                 }
+            }
+            CodeReviewAction::CopyReviewCommentsToClipboard => {
+                self.handle_copy_review_prompt(ctx);
             }
         }
     }

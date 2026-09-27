@@ -25,8 +25,10 @@ use warpui::elements::{
     Radius, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable, Stack,
     Text,
 };
+use warpui::event::KeyState;
 use warpui::keymap::Keystroke;
 use warpui::platform::Cursor;
+use warpui::platform::keyboard::KeyCode;
 use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::UiComponent;
 use warpui::units::Pixels;
@@ -101,6 +103,7 @@ pub enum CommentListAction {
     JumpToCommentLocation(CommentId),
     Cancel,
     Submit,
+    AltHeldChanged(bool),
     ShowOverflow { comment_id: CommentId },
     DeleteComment,
     DismissOverflowMenu,
@@ -110,6 +113,7 @@ pub enum CommentListAction {
 #[derive(Clone, Debug)]
 pub enum CommentListEvent {
     Submitted,
+    CopyForAgent,
     Cancelled,
     DeleteComment { comment_id: CommentId },
     EditComment(CommentId),
@@ -194,6 +198,8 @@ pub struct CommentListView {
     pending_scroll_to_comment: Option<CommentId>,
     comments_button: ViewHandle<ActionButton>,
     send_button: ViewHandle<ActionButton>,
+    /// Whether alt/option is currently held, which turns the send button into "Copy for Agent".
+    alt_held: bool,
 }
 
 impl CommentListView {
@@ -242,7 +248,7 @@ impl CommentListView {
                 AIRequestUsageModelEvent::RequestUsageUpdated
                     | AIRequestUsageModelEvent::CreditAvailabilityUpdated
             ) {
-                me.sync_send_button(ctx);
+                me.sync_action_buttons(ctx);
             }
         });
 
@@ -261,6 +267,7 @@ impl CommentListView {
             pending_scroll_to_comment: None,
             comments_button,
             send_button,
+            alt_held: false,
         }
     }
 
@@ -298,7 +305,7 @@ impl CommentListView {
     ) {
         if self.review_destination != destination {
             self.review_destination = destination;
-            self.sync_send_button(ctx);
+            self.sync_action_buttons(ctx);
             ctx.notify();
         }
     }
@@ -470,7 +477,7 @@ impl CommentListView {
         }
 
         self.recompute_comment_button_label(ctx);
-        self.sync_send_button(ctx);
+        self.sync_action_buttons(ctx);
         ctx.notify();
     }
 
@@ -888,7 +895,19 @@ impl CommentListView {
             .with_main_axis_alignment(MainAxisAlignment::End)
             .with_cross_axis_alignment(CrossAxisAlignment::Center);
         right_section.add_child(self.render_cancel_button(appearance));
-        right_section.add_child(ChildView::new(&self.send_button).finish());
+        right_section.add_child(
+            EventHandler::new(ChildView::new(&self.send_button).finish())
+                .on_modifier_state_changed(|ctx, _, key_code, state| {
+                    if matches!(key_code, KeyCode::AltLeft | KeyCode::AltRight) {
+                        ctx.dispatch_typed_action(CommentListAction::AltHeldChanged(matches!(
+                            state,
+                            KeyState::Pressed
+                        )));
+                    }
+                    DispatchEventResult::PropagateToParent
+                })
+                .finish(),
+        );
         right_section.finish()
     }
 
@@ -934,9 +953,23 @@ impl CommentListView {
         }
     }
 
-    /// Keep the stored "Send to Agent" button's enabled state and tooltip in sync with the current
-    /// destination / comment / AI-availability state.
-    fn sync_send_button(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Keep the stored "Send to Agent" button's label, keybinding, enabled state and tooltip in
+    /// sync with the current destination / comment / AI-availability state. While alt/option is
+    /// held the button becomes "Copy for Agent", which needs neither an agent nor AI credits.
+    fn sync_action_buttons(&mut self, ctx: &mut ViewContext<Self>) {
+        let has_comments = self.has_non_outdated_comments();
+        if self.alt_held {
+            let keystroke = Keystroke::parse(crate::code_review::CODE_REVIEW_COPY_KEYSTROKE)
+                .unwrap_or_default();
+            self.send_button.update(ctx, |button, ctx| {
+                button.set_label("Copy for Agent", ctx);
+                button.set_keybinding(Some(KeystrokeSource::Fixed(keystroke)), ctx);
+                button.set_disabled(!has_comments, ctx);
+                button.set_tooltip(Some("Copy review prompt to clipboard".to_string()), ctx);
+            });
+            return;
+        }
+
         let ai_available = {
             let user_workspaces = UserWorkspaces::as_ref(ctx);
             let scope = user_workspaces.team_context_for_view(ctx);
@@ -946,12 +979,16 @@ impl CommentListView {
         let enabled = self.can_send(ctx);
         let tooltip = Self::send_button_tooltip_text(
             &self.review_destination,
-            self.has_non_outdated_comments(),
+            has_comments,
             ai_available,
             ai_enabled,
         )
         .into_owned();
+        let keystroke =
+            Keystroke::parse(crate::code_review::CODE_REVIEW_SUBMIT_KEYSTROKE).unwrap_or_default();
         self.send_button.update(ctx, |button, ctx| {
+            button.set_label("Send to Agent", ctx);
+            button.set_keybinding(Some(KeystrokeSource::Fixed(keystroke)), ctx);
             button.set_disabled(!enabled, ctx);
             button.set_tooltip(Some(tooltip), ctx);
         });
@@ -1200,8 +1237,20 @@ impl TypedActionView for CommentListView {
                 ctx.emit(CommentListEvent::Cancelled);
             }
             CommentListAction::Submit => {
-                if self.can_send(ctx) {
+                // Alt/option held turns the button into "Copy for Agent".
+                if self.alt_held {
+                    if self.has_non_outdated_comments() {
+                        ctx.emit(CommentListEvent::CopyForAgent);
+                    }
+                } else if self.can_send(ctx) {
                     ctx.emit(CommentListEvent::Submitted);
+                }
+            }
+            CommentListAction::AltHeldChanged(held) => {
+                if self.alt_held != *held {
+                    self.alt_held = *held;
+                    self.sync_action_buttons(ctx);
+                    ctx.notify();
                 }
             }
             CommentListAction::ShowOverflow { comment_id } => {

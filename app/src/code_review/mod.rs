@@ -60,6 +60,9 @@ pub enum DiffSetScope {
 /// [`EditorViewEvent::CmdEnter`].
 pub const CODE_REVIEW_SUBMIT_KEYSTROKE: &str = "cmdorctrl-enter";
 
+/// The keystroke that copies the review prompt to the clipboard instead of sending it to an agent.
+pub const CODE_REVIEW_COPY_KEYSTROKE: &str = "alt-enter";
+
 /// Register keybindings for code review functionality.
 pub fn init(app: &mut AppContext) {
     app.register_editable_bindings([
@@ -101,6 +104,12 @@ pub fn init(app: &mut AppContext) {
             id!("CodeReviewView_NotEditing"),
         )
         .with_command_description("Send code review comments to agent"),
+        FixedBinding::new(
+            CODE_REVIEW_COPY_KEYSTROKE,
+            CodeReviewAction::CopyReviewCommentsToClipboard,
+            id!("CodeReviewView_NotEditing"),
+        )
+        .with_command_description("Copy code review comments as an agent prompt"),
     ]);
 
     diff_menu::init(app);
