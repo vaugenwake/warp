@@ -23,6 +23,7 @@ use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code::editor::view::{CodeEditorRenderOptions, CodeEditorView};
 use crate::code::local_code_editor::LocalCodeEditorView;
 use crate::code_review::GlobalCodeReviewModel;
+use crate::code_review::comment_list_view::CommentListAction;
 use crate::code_review::comments::{
     AttachedReviewComment, AttachedReviewCommentTarget, CommentId, CommentOrigin,
     ImportedCommentDetails, LineDiffContent, PendingImportedReviewComment,
@@ -41,8 +42,8 @@ use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::terminal::local_shell::LocalShellState;
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::vim_registers::VimRegisters;
-use crate::workspace::ActiveSession;
 use crate::workspace::sync_inputs::SyncedInputState;
+use crate::workspace::{ActiveSession, ToastStack};
 use crate::workspaces::user_workspaces::UserWorkspaces;
 
 #[derive(Default)]
@@ -81,6 +82,7 @@ fn initialize_test_app(app: &mut App) {
     app.add_singleton_model(|_| LocalShellState::NotLoaded);
     app.add_singleton_model(PersistedWorkspace::new_for_test);
     app.add_singleton_model(|_| GlobalCodeReviewModel);
+    app.add_singleton_model(|_| ToastStack);
     app.add_singleton_model(|ctx| {
         UserWorkspaces::mock(
             Arc::new(MockTeamClient::new()),
@@ -1153,5 +1155,77 @@ fn test_active_comments_not_marked_outdated() {
                 "Should have no fallbacks when content matches"
             );
         });
+    });
+}
+
+#[test]
+fn test_copy_review_prompt_writes_clipboard_and_clears_comments() {
+    App::test((), |mut app| async move {
+        let ctx = TestContext::new(&mut app, "test.txt", "line 1\nline 2\nline 3");
+
+        let line_comment =
+            create_line_comment("/repo/test.txt", 1, "line 2", "Rename this variable");
+
+        let comment_model = ctx.code_review_view.update(&mut app, |view, view_ctx| {
+            if let Some(repo) = view.active_repo.as_mut() {
+                repo.state = CodeReviewViewState::Loaded(ctx.state);
+            }
+            let model = view
+                .active_comment_model
+                .clone()
+                .expect("comment model should exist");
+            model.update(view_ctx, |batch, ctx| {
+                batch.upsert_comment(line_comment, ctx);
+            });
+
+            view.handle_copy_review_prompt(view_ctx);
+            model
+        });
+
+        let clipboard_text = app.update(|ctx| ctx.clipboard().read()).plain_text;
+        assert!(
+            clipboard_text.contains("Rename this variable"),
+            "clipboard should contain the comment body, got: {clipboard_text}"
+        );
+        assert!(
+            clipboard_text.contains("/repo/test.txt L2"),
+            "clipboard should contain the comment location, got: {clipboard_text}"
+        );
+
+        let remaining = comment_model.read(&app, |batch, _| batch.comments.len());
+        assert_eq!(remaining, 0, "comments should be cleared after copying");
+    });
+}
+
+#[test]
+fn test_alt_click_send_button_copies_prompt_instead_of_sending() {
+    App::test((), |mut app| async move {
+        let ctx = TestContext::new(&mut app, "test.txt", "line 1\nline 2\nline 3");
+
+        let line_comment = create_line_comment("/repo/test.txt", 1, "line 2", "Rename this");
+
+        let comment_list = ctx.code_review_view.update(&mut app, |view, view_ctx| {
+            if let Some(repo) = view.active_repo.as_mut() {
+                repo.state = CodeReviewViewState::Loaded(ctx.state);
+            }
+            view.active_comment_model
+                .clone()
+                .expect("comment model should exist")
+                .update(view_ctx, |batch, ctx| {
+                    batch.upsert_comment(line_comment, ctx);
+                });
+            view.comment_list_view.clone()
+        });
+
+        comment_list.update(&mut app, |list, list_ctx| {
+            list.handle_action(&CommentListAction::AltHeldChanged(true), list_ctx);
+            list.handle_action(&CommentListAction::Submit, list_ctx);
+        });
+
+        let clipboard_text = app.update(|ctx| ctx.clipboard().read()).plain_text;
+        assert!(
+            clipboard_text.contains("Rename this"),
+            "alt-click should copy the prompt, got: {clipboard_text}"
+        );
     });
 }
